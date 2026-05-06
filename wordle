@@ -1,0 +1,1793 @@
+#!/usr/bin/env python3
+"""Lightweight CLI Wordle. Plays today's NYT puzzle, syncs stats to NYT account."""
+import json
+import os
+import random
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+import urllib.error
+import urllib.request
+from collections import Counter
+from datetime import date, timedelta
+from pathlib import Path
+
+GREEN     = '\033[48;2;83;141;78;97m'
+YELLOW    = '\033[48;2;181;159;59;97m'
+GRAY      = '\033[48;2;58;58;60;97m'      # board tiles (dark, matches Wordle UI)
+KBD_GRAY  = '\033[48;2;120;124;130;97m'   # keyboard absent — lighter for dark themes
+TYPED_BG  = '\033[48;2;90;90;95;97m'      # in-progress (typed but not submitted)
+EMPTY     = '\033[38;5;240m'
+WHITE     = '\033[97m'
+DIM       = '\033[90m'
+BOLD      = '\033[1m'
+RESET     = '\033[0m'
+CLEAR     = '\033[2J\033[H'
+HIDE_CURSOR  = '\033[?25l'
+SHOW_CURSOR  = '\033[?25h'
+AUTOWRAP_OFF = '\033[?7l'
+AUTOWRAP_ON  = '\033[?7h'
+ENTER_ALT    = '\033[?1049h'
+EXIT_ALT     = '\033[?1049l'
+ANSI_RE      = re.compile(r'\033\[[0-9;]*m')
+
+DATA_DIR = Path.home() / '.wordle_cli'
+STATS_FILE = DATA_DIR / 'stats.json'
+CACHE_FILE = DATA_DIR / 'cache.json'
+AUTH_FILE  = DATA_DIR / 'auth.json'
+PENDING_FILE = DATA_DIR / 'pending.json'  # last game awaiting NYT sync
+
+UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' \
+     '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+NYT_GET_URL  = 'https://www.nytimes.com/svc/games/state/wordleV2/latests'
+NYT_POST_URL = 'https://www.nytimes.com/svc/games/state'
+
+
+# ---------- puzzle data ----------
+
+def fetch_word(d):
+    DATA_DIR.mkdir(exist_ok=True)
+    cache = {}
+    if CACHE_FILE.exists():
+        try:
+            cache = json.loads(CACHE_FILE.read_text())
+        except json.JSONDecodeError:
+            cache = {}
+    key = d.isoformat()
+    if key in cache:
+        return cache[key]
+    url = f'https://www.nytimes.com/svc/wordle/v2/{key}.json'
+    req = urllib.request.Request(url, headers={'User-Agent': UA})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read())
+    cache[key] = data
+    CACHE_FILE.write_text(json.dumps(cache))
+    return data
+
+
+# Wordle #0 — Cade Crane's first NYT-archived puzzle (CIGAR, 2021-06-19).
+# Each subsequent puzzle adds one calendar day; the API returns
+# `days_since_launch` so we can verify a number maps to the date we expected.
+WORDLE_EPOCH = date(2021, 6, 19)
+
+
+def fetch_word_by_number(num):
+    """Fetch a historical Wordle by its puzzle number (days_since_launch)."""
+    if num < 0:
+        raise ValueError(f'Wordle #{num} is before #0.')
+    target = WORDLE_EPOCH + timedelta(days=num)
+    if target > date.today():
+        raise ValueError(
+            f"Wordle #{num} hasn't been published yet "
+            f'(it would be {target.isoformat()}).'
+        )
+    data = fetch_word(target)
+    actual = data.get('days_since_launch')
+    if isinstance(actual, int) and actual != num:
+        # Epoch drift would be obvious — surface it instead of silently lying.
+        raise RuntimeError(
+            f'Archive lookup mismatch: asked for #{num}, '
+            f'NYT returned #{actual} for {target.isoformat()}.'
+        )
+    return data
+
+
+# ---------- scoring + rendering ----------
+
+def score(guess, solution):
+    result = ['b'] * 5
+    sol = list(solution)
+    for i in range(5):
+        if guess[i] == sol[i]:
+            result[i] = 'g'
+            sol[i] = None
+    for i in range(5):
+        if result[i] == 'g':
+            continue
+        if guess[i] in sol:
+            result[i] = 'y'
+            sol[sol.index(guess[i])] = None
+    return result
+
+
+def visible_len(s):
+    return len(ANSI_RE.sub('', s))
+
+
+def term_size():
+    s = shutil.get_terminal_size((80, 24))
+    return s.columns, s.lines
+
+
+def enter_fullscreen():
+    sys.stdout.write(ENTER_ALT + CLEAR + HIDE_CURSOR)
+    sys.stdout.flush()
+
+
+def exit_fullscreen():
+    sys.stdout.write(AUTOWRAP_ON + SHOW_CURSOR + EXIT_ALT)
+    sys.stdout.flush()
+
+
+class RawTerminal:
+    """Put stdin into raw (unbuffered, no-echo) mode for the duration of a
+    `with` block, restoring the prior tty attrs on exit even if an exception
+    propagates."""
+
+    def __enter__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        return self
+
+    def __exit__(self, *exc):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+
+def read_key():
+    """Read a single key event from stdin (raw mode assumed). Returns
+    'enter', 'backspace', 'esc', 'ctrl-c', 'ctrl-z', or a one-character string."""
+    ch = sys.stdin.read(1)
+    if ch in ('\r', '\n'):
+        return 'enter'
+    if ch in ('\x7f', '\x08'):
+        return 'backspace'
+    if ch == '\x03':
+        return 'ctrl-c'
+    if ch == '\x1a':
+        return 'ctrl-z'
+    if ch == '\x1b':
+        # Escape may start a CSI sequence (arrow keys etc.). Drain any
+        # pending bytes that arrive within ~50 ms so we don't surface them
+        # as ordinary keystrokes; if nothing follows it's a bare Esc.
+        rd, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if rd:
+            sys.stdin.read(1)
+            rd2, _, _ = select.select([sys.stdin], [], [], 0.01)
+            if rd2:
+                sys.stdin.read(1)
+            return 'unknown'
+        return 'esc'
+    return ch
+
+
+# ---------- tile primitives ----------
+
+def small_tile(ch, state):
+    color = {'g': GREEN, 'y': YELLOW, 'b': GRAY}[state]
+    return f'{color}{BOLD} {ch.upper()} {RESET}'
+
+
+def small_empty_tile():
+    return f'{EMPTY}[ ]{RESET}'
+
+
+def small_typed_tile(ch):
+    return f'{TYPED_BG}{BOLD} {ch.upper()} {RESET}'
+
+
+# Kept as an alias so any external callers / share helpers still resolve.
+def tile(ch, state):
+    return small_tile(ch, state)
+
+
+def empty_tile():
+    return small_empty_tile()
+
+
+def big_tile_lines(ch, state):
+    color = {'g': GREEN, 'y': YELLOW, 'b': GRAY}[state]
+    return [
+        f'{color}     {RESET}',
+        f'{color}{BOLD}  {ch.upper()}  {RESET}',
+        f'{color}     {RESET}',
+    ]
+
+
+def big_empty_tile_lines():
+    return [
+        f'{EMPTY}┌───┐{RESET}',
+        f'{EMPTY}│   │{RESET}',
+        f'{EMPTY}└───┘{RESET}',
+    ]
+
+
+def big_typed_tile_lines(ch):
+    return [
+        f'{TYPED_BG}     {RESET}',
+        f'{TYPED_BG}{BOLD}  {ch.upper()}  {RESET}',
+        f'{TYPED_BG}     {RESET}',
+    ]
+
+
+# ---------- board / keyboard ----------
+
+def _row_tiles(guess, result):
+    """Single-line tiles for a committed row."""
+    return ' '.join(small_tile(c, r) for c, r in zip(guess, result))
+
+
+def _row_typed(current_guess):
+    """Single-line tiles for the active row: typed letters + remaining empties."""
+    parts = [small_typed_tile(ch) for ch in current_guess]
+    parts += [small_empty_tile()] * (5 - len(current_guess))
+    return ' '.join(parts)
+
+
+def _row_empty():
+    return ' '.join([small_empty_tile()] * 5)
+
+
+def board_lines(guesses, results, current_guess=''):
+    out = []
+    active_idx = len(guesses) if len(guesses) < 6 else -1
+    for i in range(6):
+        if i < len(guesses):
+            out.append(_row_tiles(guesses[i], results[i]))
+        elif i == active_idx and current_guess:
+            out.append(_row_typed(current_guess))
+        else:
+            out.append(_row_empty())
+    return out
+
+
+def _big_row(tiles_lines):
+    """Combine 5 per-tile [top, mid, bot] lists into 3 board lines."""
+    return [' '.join(t[r] for t in tiles_lines) for r in range(3)]
+
+
+def big_board_lines(guesses, results, current_guess=''):
+    out = []
+    active_idx = len(guesses) if len(guesses) < 6 else -1
+    for i in range(6):
+        if i < len(guesses):
+            tiles_lines = [big_tile_lines(c, r)
+                           for c, r in zip(guesses[i], results[i])]
+        elif i == active_idx and current_guess:
+            tiles_lines = [big_typed_tile_lines(ch) for ch in current_guess]
+            tiles_lines += [big_empty_tile_lines()] * (5 - len(current_guess))
+        else:
+            tiles_lines = [big_empty_tile_lines() for _ in range(5)]
+        out.extend(_big_row(tiles_lines))
+        if i < 5:
+            out.append('')
+    return out
+
+
+def _kbd_state(guesses, results):
+    rank = {'unknown': 0, 'b': 1, 'y': 2, 'g': 3}
+    state = {}
+    for g, r in zip(guesses, results):
+        for ch, rr in zip(g, r):
+            if rank[rr] > rank.get(state.get(ch, 'unknown'), 0):
+                state[ch] = rr
+    return state
+
+
+def keyboard_lines(guesses, results):
+    state = _kbd_state(guesses, results)
+    rows = ['QWERTYUIOP', 'ASDFGHJKL', 'ZXCVBNM']
+    out = []
+    for idx, row in enumerate(rows):
+        line = ' ' * idx
+        keys = []
+        for ch in row:
+            s = state.get(ch.lower(), 'unknown')
+            if s == 'g':
+                keys.append(f'{GREEN}{BOLD} {ch} {RESET}')
+            elif s == 'y':
+                keys.append(f'{YELLOW}{BOLD} {ch} {RESET}')
+            elif s == 'b':
+                keys.append(f'{KBD_GRAY} {ch} {RESET}')
+            else:
+                keys.append(f'{WHITE}{BOLD} {ch} {RESET}')
+        line += ' '.join(keys)
+        out.append(line)
+    return out
+
+
+def big_keyboard_lines(guesses, results):
+    state = _kbd_state(guesses, results)
+    rows = ['QWERTYUIOP', 'ASDFGHJKL', 'ZXCVBNM']
+    out = []
+    for idx, row in enumerate(rows):
+        line = ' ' * (idx * 3)
+        keys = []
+        for ch in row:
+            s = state.get(ch.lower(), 'unknown')
+            if s == 'g':
+                keys.append(f'{GREEN}{BOLD}  {ch}  {RESET}')
+            elif s == 'y':
+                keys.append(f'{YELLOW}{BOLD}  {ch}  {RESET}')
+            elif s == 'b':
+                keys.append(f'{KBD_GRAY}  {ch}  {RESET}')
+            else:
+                keys.append(f'{WHITE}{BOLD}  {ch}  {RESET}')
+        line += ' '.join(keys)
+        out.append(line)
+    return out
+
+
+def huge_keyboard_lines(guesses, results):
+    """Keyboard with 5×3 keys to match the big tile aesthetic.
+
+    Same visible width per row as `big_keyboard_lines` (5 cols/key + gap),
+    but each key spans three lines with the letter centered, so the keyboard
+    visually balances against the 5×3 board tiles.
+    """
+    state = _kbd_state(guesses, results)
+    rows = ['QWERTYUIOP', 'ASDFGHJKL', 'ZXCVBNM']
+    out = []
+    for idx, row in enumerate(rows):
+        offset = ' ' * (idx * 3)
+        top, mid, bot = [], [], []
+        for ch in row:
+            s = state.get(ch.lower(), 'unknown')
+            if s == 'g':
+                color = GREEN
+            elif s == 'y':
+                color = YELLOW
+            elif s == 'b':
+                color = KBD_GRAY
+            else:
+                color = WHITE
+            blank = f'{color}     {RESET}'
+            label = f'{color}{BOLD}  {ch}  {RESET}'
+            top.append(blank)
+            mid.append(label)
+            bot.append(blank)
+        out.append(offset + ' '.join(top))
+        out.append(offset + ' '.join(mid))
+        out.append(offset + ' '.join(bot))
+        if idx < 2:
+            out.append('')
+    return out
+
+
+COPY_HINT = (f'{BOLD}C{RESET}{DIM} copy share  ·  any other key to continue{RESET}')
+
+
+def render(data, guesses, results, current_guess='', message='', account=None,
+           hard_mode=False, extra_lines=None):
+    """Render the game UI in a full-terminal centered frame.
+
+    Picks a big (5×3 tile) layout when there is enough vertical and horizontal
+    room; falls back to a compact 3×1 layout, and to a non-framed inline mode
+    for very small terminals. The cursor is always hidden — typing is shown
+    inside the active board row, not on a separate prompt line.
+    """
+    cols, rows = term_size()
+    if cols < 45 or rows < 20:
+        return _render_inline(data, guesses, results, current_guess, message,
+                              account, hard_mode, extra_lines)
+
+    big = cols >= 65 and rows >= 35
+    huge_kbd = cols >= 65 and rows >= 43
+
+    num = data.get('days_since_launch', '?')
+    pdate = data.get('print_date', '')
+    badge = f' {DIM}· synced{RESET}' if account else f' {DIM}· local{RESET}'
+    hard = f' {DIM}· hard{RESET}' if hard_mode else ''
+
+    content = [f'{BOLD}WORDLE{RESET} {DIM}#{num}  {pdate}{RESET}{badge}{hard}', '']
+    if big:
+        content += big_board_lines(guesses, results, current_guess)
+        content.append('')
+        if huge_kbd:
+            content += huge_keyboard_lines(guesses, results)
+        else:
+            content += big_keyboard_lines(guesses, results)
+    else:
+        content += board_lines(guesses, results, current_guess)
+        content.append('')
+        content += keyboard_lines(guesses, results)
+    content.append('')
+    content.append(message)
+    if extra_lines:
+        for line in extra_lines:
+            content.append(line)
+
+    inner_h = rows - 2
+    top_pad = max(0, (inner_h - len(content)) // 2)
+
+    buf = [CLEAR + HIDE_CURSOR + AUTOWRAP_OFF]
+    buf.append(f'\033[1;1H{DIM}┌' + '─' * (cols - 2) + f'┐{RESET}')
+    for r in range(2, rows):
+        buf.append(f'\033[{r};1H{DIM}│{RESET}\033[{r};{cols}H{DIM}│{RESET}')
+    buf.append(f'\033[{rows};1H{DIM}└' + '─' * (cols - 2) + f'┘{RESET}')
+
+    for i, line in enumerate(content):
+        r = 2 + top_pad + i
+        if r >= rows:
+            break
+        vis = visible_len(line)
+        c = max(2, 1 + (cols - vis) // 2)
+        if line:
+            buf.append(f'\033[{r};{c}H{line}')
+
+    buf.append('\033[1;1H')
+    sys.stdout.write(''.join(buf))
+    sys.stdout.flush()
+
+
+def _render_inline(data, guesses, results, current_guess, message, account,
+                   hard_mode, extra_lines):
+    """Compact non-framed fallback for terminals smaller than 45×20."""
+    sys.stdout.write(CLEAR + AUTOWRAP_ON + HIDE_CURSOR)
+    num = data.get('days_since_launch', '?')
+    pdate = data.get('print_date', '')
+    badge = f' {DIM}· synced{RESET}' if account else f' {DIM}· local{RESET}'
+    hard = f' {DIM}· hard{RESET}' if hard_mode else ''
+    print(f'  {BOLD}WORDLE{RESET} {DIM}#{num}  {pdate}{RESET}{badge}{hard}')
+    print()
+    for line in board_lines(guesses, results, current_guess):
+        print('  ' + line)
+    print()
+    for line in keyboard_lines(guesses, results):
+        print('  ' + line)
+    print()
+    print(f'  {message}' if message else '')
+    if extra_lines:
+        for line in extra_lines:
+            print(f'  {line}' if line else '')
+    sys.stdout.flush()
+
+
+# ---------- local stats ----------
+
+def load_stats():
+    if STATS_FILE.exists():
+        try:
+            return json.loads(STATS_FILE.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {
+        'played': 0, 'won': 0,
+        'streak': 0, 'max_streak': 0,
+        'distribution': [0] * 6,
+        'last_date': None, 'last_won': False,
+    }
+
+
+def save_stats(stats):
+    DATA_DIR.mkdir(exist_ok=True)
+    STATS_FILE.write_text(json.dumps(stats))
+
+
+def update_local_stats(stats, won, attempts, today):
+    if stats.get('last_date') == today.isoformat():
+        return stats
+    stats['played'] += 1
+    last = stats.get('last_date')
+    if won:
+        stats['won'] += 1
+        stats['distribution'][attempts - 1] += 1
+        cont = False
+        if last and stats.get('last_won'):
+            try:
+                last_d = date.fromisoformat(last)
+                cont = (today - last_d).days == 1
+            except ValueError:
+                pass
+        stats['streak'] = stats['streak'] + 1 if cont else 1
+        stats['max_streak'] = max(stats['max_streak'], stats['streak'])
+    else:
+        stats['streak'] = 0
+    stats['last_date'] = today.isoformat()
+    stats['last_won'] = won
+    save_stats(stats)
+    return stats
+
+
+# ---------- nyt account sync ----------
+
+def load_auth():
+    if not AUTH_FILE.exists():
+        return None
+    try:
+        return json.loads(AUTH_FILE.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def save_auth(cookie):
+    DATA_DIR.mkdir(exist_ok=True)
+    AUTH_FILE.write_text(json.dumps({'NYT-S': cookie}))
+    try:
+        os.chmod(AUTH_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def save_pending(puzzle_data, guesses, results, won, hard_mode=False, synced=False):
+    DATA_DIR.mkdir(exist_ok=True)
+    PENDING_FILE.write_text(json.dumps({
+        'puzzle': puzzle_data,
+        'guesses': guesses,
+        'results': results,
+        'won': won,
+        'hard_mode': hard_mode,
+        'synced': synced,
+    }))
+
+
+def load_pending():
+    if not PENDING_FILE.exists():
+        return None
+    try:
+        return json.loads(PENDING_FILE.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def mark_synced():
+    p = load_pending()
+    if p is not None:
+        p['synced'] = True
+        PENDING_FILE.write_text(json.dumps(p))
+
+
+def nyt_request(method, url, cookie, body=None, extra_headers=None):
+    headers = {
+        'User-Agent': UA,
+        'Accept': 'application/json',
+        'Cookie': f'NYT-S={cookie}',
+        'Referer': 'https://www.nytimes.com/games/wordle/index.html',
+        'Origin': 'https://www.nytimes.com',
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode('utf-8')
+        headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        raw = r.read()
+        return json.loads(raw) if raw else {}
+
+
+def nyt_fetch_state(cookie, puzzle_id):
+    url = f'{NYT_GET_URL}?puzzle_ids={puzzle_id}'
+    return nyt_request('GET', url, cookie)
+
+
+def nyt_post_state(cookie, body, trigger='complete'):
+    from datetime import datetime, timezone
+    iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.') \
+        + f'{datetime.now(timezone.utc).microsecond // 1000:03d}Z'
+    extra = {
+        'x-games-client-time': iso,
+        'x-games-aws': 'wrd',
+        'x-games-save-trigger': trigger,
+    }
+    return nyt_request('POST', NYT_POST_URL, cookie, body=body, extra_headers=extra)
+
+
+def evaluations_from_results(results):
+    m = {'g': 'correct', 'y': 'present', 'b': 'absent'}
+    return [[m[c] for c in row] for row in results]
+
+
+def build_game_data(prev_state, puzzle_data, guesses, results, won, hard_mode=False):
+    """Build wordleV2 game_data matching NYT's exact schema.
+
+    Only four fields are stored in persist.game per the official client:
+    boardState, currentRowIndex, status, hardMode. Stats are computed
+    server-side from this state.
+    """
+    board = list(guesses) + [''] * (6 - len(guesses))
+    return {
+        'boardState': board,
+        'currentRowIndex': len(guesses),
+        'status': 'WIN' if won else 'FAIL',
+        'hardMode': bool(hard_mode),
+    }
+
+
+def build_post_body(prev_state, puzzle_data, game_data, fallback_user_id=None):
+    """Wrap game_data into the envelope the /svc/games/state POST expects."""
+    schema_version = (prev_state or {}).get('schema_version') \
+        or (prev_state or {}).get('schemaVersion') \
+        or 'v2'
+    user_id = (prev_state or {}).get('user_id') or fallback_user_id
+    body = {
+        'game': 'wordleV2',
+        'game_data': game_data,
+        'puzzle_id': str(puzzle_data['id']),
+        'print_date': puzzle_data.get('print_date', date.today().isoformat()),
+        'schema_version': schema_version,
+        'timestamp': int(time.time() * 1000),
+    }
+    if user_id is not None:
+        body['user_id'] = user_id
+    return body
+
+
+def nyt_view_from_response(resp):
+    """Translate NYT GET/POST response into our local stats shape.
+
+    Stats live at player.stats.wordle.totalStats per the official client; the
+    legacyStats node is only the migration buffer from before NYT's acquisition.
+    """
+    player = (resp or {}).get('player') or {}
+    wordle = (player.get('stats') or {}).get('wordle') or {}
+    s = wordle.get('totalStats') or wordle.get('legacyStats') or {}
+    g = s.get('guesses') or {}
+    dist = [int(g.get(str(i), 0)) for i in range(1, 7)]
+    return {
+        'played': int(s.get('gamesPlayed', 0)),
+        'won': int(s.get('gamesWon', 0)),
+        'streak': int(s.get('currentStreak', 0)),
+        'max_streak': int(s.get('maxStreak', 0)),
+        'distribution': dist,
+        'last_date': s.get('lastWonPrintDate') or None,
+        'last_won': True,
+        '_fail_count': int(g.get('fail', 0)),
+    }
+
+
+# ---------- display ----------
+
+def show_stats(stats, source=''):
+    played = stats['played']
+    win_pct = round(100 * stats['won'] / played) if played else 0
+    print()
+    label = f'STATISTICS {DIM}({source}){RESET}' if source else 'STATISTICS'
+    print(f'  {BOLD}{label}{RESET}')
+    print(f'  {stats["played"]} played   {win_pct}% wins   '
+          f'streak {stats["streak"]}   max {stats["max_streak"]}')
+    print()
+    print(f'  {BOLD}GUESS DISTRIBUTION{RESET}')
+    dist = stats['distribution']
+    mx = max(dist) or 1
+    for i, count in enumerate(dist, 1):
+        bar_len = int(count / mx * 20) if count else 0
+        bar = f'{GREEN}{" " * (bar_len + 2)}{RESET}' if bar_len else f'{DIM}··{RESET}'
+        print(f'  {i}  {bar} {count}')
+    print()
+
+
+def share_grid(results):
+    sym = {'g': '🟩', 'y': '🟨', 'b': '⬛'}
+    return '\n'.join(''.join(sym[c] for c in row) for row in results)
+
+
+def share_text(puzzle_data, guesses, results, won, hard_mode):
+    """Build the official Wordle share format, e.g.:
+        Wordle 1,781 4/6*
+
+        ⬛🟨🟨⬛⬛
+        ...
+    """
+    num = puzzle_data.get('days_since_launch', 0)
+    score = f'{len(guesses)}/6' if won else 'X/6'
+    star = '*' if hard_mode else ''
+    header = f'Wordle {num:,} {score}{star}'
+    return f'{header}\n\n{share_grid(results)}'
+
+
+def copy_to_clipboard(text):
+    """Best-effort clipboard copy. Returns True on success."""
+    if sys.platform == 'darwin' and shutil.which('pbcopy'):
+        cmd = ['pbcopy']
+    elif shutil.which('wl-copy'):
+        cmd = ['wl-copy']
+    elif shutil.which('xclip'):
+        cmd = ['xclip', '-selection', 'clipboard']
+    elif shutil.which('xsel'):
+        cmd = ['xsel', '--clipboard', '--input']
+    else:
+        return False
+    try:
+        p = subprocess.run(cmd, input=text.encode('utf-8'), check=True, timeout=3)
+        return p.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+# ---------- hard mode ----------
+
+def hard_mode_constraints(guesses, results):
+    """Derive hard-mode constraints from prior guesses.
+
+    Returns (greens, min_letters):
+      greens: dict {pos: letter} — letters revealed at fixed positions
+      min_letters: Counter {letter: min_count_required}
+    """
+    greens = {}
+    min_letters = Counter()
+    for guess, res in zip(guesses, results):
+        seen = Counter()
+        for i, (ch, r) in enumerate(zip(guess, res)):
+            if r == 'g':
+                greens[i] = ch
+                seen[ch] += 1
+            elif r == 'y':
+                seen[ch] += 1
+        for ch, n in seen.items():
+            if n > min_letters[ch]:
+                min_letters[ch] = n
+    return greens, min_letters
+
+
+def hard_mode_violation(guess, greens, min_letters):
+    """Return a human message if guess violates hard mode, else None."""
+    for pos, letter in greens.items():
+        if guess[pos] != letter:
+            return f'{(pos + 1)}{_ord_suffix(pos + 1)} letter must be {letter.upper()}.'
+    have = Counter(guess)
+    for letter, n in min_letters.items():
+        if have[letter] < n:
+            req = 'once' if n == 1 else f'{n} times'
+            return f'Guess must contain {letter.upper()} ({req}).'
+    return None
+
+
+def _ord_suffix(n):
+    return {1: 'st', 2: 'nd', 3: 'rd'}.get(n if n < 20 else n % 10, 'th')
+
+
+# ---------- subcommands ----------
+
+LOGIN_HELP = f"""
+{BOLD}Connect to your NYT account{RESET}
+
+NYT login can't be scripted (CAPTCHA + Cloudflare), so we use your
+{BOLD}NYT-S{RESET} session cookie instead. One-time setup:
+
+  1. In your browser, sign in at {DIM}https://www.nytimes.com/games/wordle{RESET}
+  2. Open DevTools  →  Application  →  Cookies  →  {DIM}https://www.nytimes.com{RESET}
+  3. Find the cookie named {BOLD}NYT-S{RESET} and copy its {BOLD}Value{RESET} (long string)
+  4. Paste it below
+
+Stored locally at {DIM}{AUTH_FILE}{RESET} with mode 0600.
+The cookie typically lasts ~6–12 months.
+"""
+
+
+def cmd_login():
+    print(LOGIN_HELP)
+    try:
+        cookie = input('  NYT-S cookie: ').strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 1
+    if not cookie:
+        print(f'  {YELLOW} ! {RESET} Empty cookie, aborting.')
+        return 1
+    if cookie.lower().startswith('nyt-s='):
+        cookie = cookie.split('=', 1)[1]
+    save_auth(cookie)
+    print(f'  Verifying with NYT…')
+    try:
+        nyt_fetch_state(cookie, 1)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            print(f'  {GRAY} ! {RESET} NYT rejected the cookie ({e.code}). '
+                  f'Make sure you copied the full Value of {BOLD}NYT-S{RESET}.')
+            try:
+                AUTH_FILE.unlink()
+            except FileNotFoundError:
+                pass
+            return 1
+        print(f'  {DIM}HTTP {e.code} — saved anyway, will retry on play.{RESET}')
+    except Exception as e:
+        print(f'  {DIM}Could not verify ({e}); saved anyway.{RESET}')
+        return 0
+    print(f'  {GREEN} ✓ {RESET} Connected. Stats will sync on each play.')
+    return 0
+
+
+def cmd_logout():
+    if AUTH_FILE.exists():
+        AUTH_FILE.unlink()
+        print('  Logged out. Stats now stored locally only.')
+    else:
+        print('  Not logged in.')
+    return 0
+
+
+def try_sync(cookie, puzzle_data, guesses, results, won,
+             prev_state=None, fallback_user_id=None, hard_mode=False):
+    """Attempt one POST to NYT. Returns (ok, error_msg, nyt_view)."""
+    try:
+        if prev_state is None:
+            try:
+                resp = nyt_fetch_state(cookie, puzzle_data['id'])
+                states = resp.get('states') or []
+                prev_state = next(
+                    (s for s in states if s.get('puzzle_id') == puzzle_data['id']),
+                    states[0] if states else None,
+                )
+                if fallback_user_id is None:
+                    fallback_user_id = (
+                        (prev_state or {}).get('user_id')
+                        or (resp.get('player') or {}).get('user_id')
+                    )
+            except Exception:
+                pass
+        game_data = build_game_data(prev_state, puzzle_data, guesses, results, won,
+                                    hard_mode=hard_mode)
+        body = build_post_body(prev_state, puzzle_data, game_data,
+                               fallback_user_id=fallback_user_id)
+        resp = nyt_post_state(cookie, body, trigger='complete')
+        return True, '', nyt_view_from_response(resp)
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode('utf-8', errors='replace')[:200]
+        except Exception:
+            err_body = ''
+        return False, f'Sync failed (HTTP {e.code}). {err_body}'.strip(), None
+    except Exception as e:
+        return False, f"Couldn't sync to NYT ({e}).", None
+
+
+def cmd_sync():
+    auth = load_auth()
+    cookie = (auth or {}).get('NYT-S')
+    if not cookie:
+        print(f'  {DIM} · {RESET} Not logged in. Run {BOLD}wordle login{RESET} first.')
+        return 1
+    pending = load_pending()
+    if not pending or pending.get('synced'):
+        print(f'  {GREEN} ✓ {RESET} Nothing pending. All caught up.')
+        return 0
+    puzzle = pending['puzzle']
+    print(f'  Pushing Wordle #{puzzle.get("days_since_launch", "?")} '
+          f'({puzzle.get("print_date")}) to NYT…')
+    ok, err, view = try_sync(cookie, puzzle,
+                             pending['guesses'], pending['results'], pending['won'],
+                             hard_mode=pending.get('hard_mode', False))
+    if ok:
+        clear_pending()
+        print(f'  {GREEN} ✓ {RESET} Synced.')
+        if view:
+            show_stats(view, source='NYT account')
+        return 0
+    print(f'  {YELLOW} ! {RESET} {err}')
+    return 1
+
+
+def cmd_share():
+    pending = load_pending()
+    if not pending:
+        print(f'  {DIM} · {RESET} No game on record yet — play one first.')
+        return 1
+    share = share_text(
+        pending['puzzle'],
+        pending['guesses'],
+        pending['results'],
+        pending['won'],
+        pending.get('hard_mode', False),
+    )
+    print(share)
+    print()
+    if copy_to_clipboard(share):
+        print(f'  {GREEN} ✓ {RESET} Copied to clipboard.')
+        return 0
+    print(f'  {DIM}(clipboard tool not found — share text above){RESET}')
+    return 0
+
+
+def cmd_status():
+    auth = load_auth()
+    if auth and auth.get('NYT-S'):
+        print(f'  {GREEN} ✓ {RESET} Logged in (cookie ends …{auth["NYT-S"][-6:]})')
+    else:
+        print(f'  {DIM} · {RESET} Not logged in. Run {BOLD}wordle login{RESET} to sync stats.')
+    return 0
+
+
+# ---------- zen mode (offline, unlimited) ----------
+
+ZEN_WORDS = [
+    # Curated common 5-letter English words for zen-mode solutions. Aim is
+    # ~1800 words: large enough that repeats are uncommon over a long
+    # session, small enough that words remain familiar (no archaic or
+    # heavily technical vocabulary). Used as the *solution* pool only;
+    # guess validation still uses the broader system dictionary so the
+    # player can type less-common words too.
+    'abide', 'about', 'above', 'abuse', 'acorn', 'acrid', 'actor', 'acute',
+    'adapt', 'adept', 'admin', 'admit', 'adobe', 'adopt', 'adore', 'adult',
+    'after', 'again', 'agent', 'agile', 'aging', 'agony', 'agree', 'ahead',
+    'aided', 'aimed', 'aisle', 'alarm', 'album', 'alert', 'algae', 'alien',
+    'align', 'alike', 'alive', 'allow', 'alloy', 'aloft', 'alone', 'along',
+    'aloof', 'aloud', 'alpha', 'altar', 'alter', 'amass', 'amaze', 'amber',
+    'amble', 'ample', 'amply', 'amuse', 'angel', 'anger', 'angle', 'angry',
+    'angst', 'ankle', 'annex', 'annoy', 'apart', 'apple', 'apply', 'april',
+    'apron', 'arbor', 'areas', 'arena', 'argue', 'arise', 'armed', 'armor',
+    'aroma', 'arose', 'array', 'arrow', 'arson', 'ashen', 'aside', 'asked',
+    'asset', 'atlas', 'atoll', 'atone', 'attic', 'audio', 'audit', 'avail',
+    'avert', 'avoid', 'await', 'awake', 'award', 'aware', 'awash', 'awful',
+    'axiom', 'azure',
+    'bacon', 'badge', 'badly', 'bagel', 'baked', 'baker', 'balls', 'banal',
+    'bands', 'bandy', 'banjo', 'barge', 'basic', 'basil', 'basin', 'basis',
+    'baste', 'batch', 'bathe', 'baton', 'batty', 'beach', 'beads', 'beady',
+    'beams', 'beans', 'beard', 'beast', 'beats', 'beefy', 'began', 'begin',
+    'begun', 'being', 'belch', 'belie', 'belly', 'below', 'bench', 'beret',
+    'berry', 'beset', 'bevel', 'bezel', 'bible', 'bicep', 'biggie', 'bigot',
+    'biker', 'bills', 'binds', 'binge', 'biome', 'birch', 'birds', 'birth',
+    'bites', 'black', 'blade', 'blame', 'bland', 'blank', 'blare', 'blast',
+    'blaze', 'bleak', 'bleat', 'bleed', 'blend', 'bless', 'blimp', 'blind',
+    'blink', 'bliss', 'bloat', 'block', 'bloke', 'blond', 'blood', 'bloom',
+    'blown', 'bluer', 'bluff', 'blunt', 'blurt', 'blush', 'board', 'boast',
+    'boats', 'bobby', 'boggy', 'bogus', 'bonds', 'bones', 'bonus', 'booby',
+    'books', 'boost', 'booth', 'booty', 'booze', 'boozy', 'borne', 'bosom',
+    'bossy', 'botch', 'bough', 'bound', 'bowel', 'boxed', 'boxer', 'braid',
+    'brain', 'brake', 'brand', 'brash', 'brass', 'brave', 'bravo', 'brawl',
+    'brawn', 'bread', 'break', 'breed', 'briar', 'bribe', 'brick', 'bride',
+    'brief', 'brine', 'bring', 'brink', 'briny', 'brisk', 'broad', 'broil',
+    'broke', 'brood', 'brook', 'broom', 'broth', 'brown', 'brunt', 'brush',
+    'brute', 'buddy', 'budge', 'buggy', 'bugle', 'build', 'built', 'bulge',
+    'bulky', 'bully', 'bumpy', 'bunch', 'bunny', 'burly', 'burnt', 'burst',
+    'butte', 'buyer', 'bylaw',
+    'cabin', 'cable', 'cacao', 'cache', 'cadet', 'cages', 'cakes', 'camel',
+    'cameo', 'candy', 'canny', 'canoe', 'caper', 'carat', 'cards', 'cared',
+    'cargo', 'carol', 'carry', 'carve', 'cases', 'caste', 'catch', 'cause',
+    'cease', 'cedar', 'cello', 'cents', 'chafe', 'chain', 'chair', 'chalk',
+    'champ', 'chant', 'chaos', 'chard', 'charm', 'chart', 'chase', 'chasm',
+    'cheap', 'cheat', 'check', 'cheek', 'cheer', 'chess', 'chest', 'chick',
+    'chief', 'child', 'chili', 'chill', 'chime', 'china', 'chips', 'chirp',
+    'chock', 'choir', 'choke', 'chops', 'chord', 'chore', 'chose', 'chuck',
+    'chunk', 'churn', 'chute', 'cider', 'cigar', 'cinch', 'circa', 'cited',
+    'civic', 'civil', 'clack', 'claim', 'clamp', 'clang', 'clank', 'clash',
+    'clasp', 'class', 'clean', 'clear', 'cleat', 'cleft', 'clerk', 'click',
+    'cliff', 'climb', 'cling', 'clink', 'cloak', 'clock', 'clogs', 'clone',
+    'close', 'cloth', 'cloud', 'clout', 'clove', 'clown', 'cluck', 'clued',
+    'clump', 'clung', 'coach', 'coast', 'coats', 'cobra', 'cocoa', 'codes',
+    'coils', 'colon', 'color', 'comet', 'comfy', 'comic', 'comma', 'conch',
+    'condo', 'conic', 'cooks', 'cools', 'coral', 'cords', 'corny', 'corps',
+    'couch', 'cough', 'could', 'count', 'coupe', 'court', 'coven', 'cover',
+    'covet', 'cowed', 'cower', 'coyly', 'crack', 'craft', 'cramp', 'crane',
+    'crank', 'crash', 'crass', 'crate', 'crave', 'crawl', 'craze', 'crazy',
+    'creak', 'cream', 'credo', 'creed', 'creek', 'creep', 'crepe', 'crept',
+    'crest', 'crick', 'crime', 'crimp', 'crisp', 'croak', 'crock', 'crony',
+    'crook', 'croon', 'cross', 'crowd', 'crown', 'crude', 'cruel', 'crumb',
+    'crush', 'crust', 'crypt', 'cubic', 'curls', 'curly', 'curry', 'curse',
+    'curve', 'curvy', 'cycle', 'cynic',
+    'daddy', 'daily', 'dairy', 'daisy', 'dance', 'dandy', 'dared', 'dates',
+    'dazed', 'deals', 'dealt', 'death', 'debit', 'debug', 'debut', 'decaf',
+    'decay', 'decoy', 'decry', 'deeds', 'deeps', 'defer', 'deify', 'deity',
+    'delay', 'delta', 'delve', 'demon', 'denim', 'dense', 'depot', 'depth',
+    'derby', 'desks', 'deter', 'devil', 'dials', 'diary', 'dicey', 'digit',
+    'diner', 'dingo', 'dingy', 'dirty', 'ditch', 'ditty', 'divan', 'diver',
+    'divot', 'dizzy', 'dodge', 'dodgy', 'doggy', 'doing', 'dolls', 'donor',
+    'donut', 'doors', 'doses', 'doubt', 'dough', 'dowdy', 'dowel', 'downy',
+    'dowry', 'dozen', 'draft', 'drain', 'drake', 'drama', 'drank', 'drape',
+    'drawl', 'drawn', 'dread', 'dream', 'dress', 'dried', 'drier', 'drift',
+    'drill', 'drink', 'drive', 'droll', 'drone', 'drool', 'droop', 'dross',
+    'drove', 'drown', 'druid', 'drugs', 'drums', 'drunk', 'dryer', 'dryly',
+    'ducks', 'ducal', 'ducts', 'dukes', 'dummy', 'dumps', 'dunce', 'dunes',
+    'durum', 'dusks', 'dusty', 'dutch', 'duvet', 'dwarf', 'dwell', 'dwelt',
+    'dying',
+    'eager', 'eagle', 'early', 'earns', 'earth', 'eased', 'eater', 'ebbed',
+    'ebony', 'edged', 'edges', 'edict', 'edify', 'eerie', 'egret', 'eight',
+    'eject', 'elate', 'elbow', 'elder', 'elect', 'elegy', 'elfin', 'elite',
+    'elope', 'elude', 'elves', 'email', 'embed', 'ember', 'emcee', 'empty',
+    'enact', 'ended', 'endow', 'enemy', 'enjoy', 'ennui', 'enrol', 'ensue',
+    'enter', 'entry', 'envoy', 'epoch', 'epoxy', 'equal', 'equip', 'erase',
+    'erect', 'erode', 'error', 'erupt', 'essay', 'ester', 'ether', 'ethic',
+    'event', 'every', 'evict', 'evoke', 'exact', 'exalt', 'excel', 'exert',
+    'exile', 'exist', 'extol', 'extra', 'exult', 'eying',
+    'fable', 'faced', 'facet', 'faded', 'fails', 'faint', 'fairy', 'faith',
+    'falls', 'false', 'famed', 'fancy', 'fangs', 'farce', 'fatal', 'fated',
+    'fatty', 'fault', 'fauna', 'favor', 'feast', 'fedora', 'feign', 'feint',
+    'felon', 'femme', 'femur', 'fence', 'feral', 'ferry', 'fetal', 'fetch',
+    'fetid', 'fever', 'fewer', 'fiber', 'fiche', 'field', 'fiend', 'fiery',
+    'fifth', 'fifty', 'fight', 'filed', 'files', 'filet', 'filled', 'films',
+    'filmy', 'filth', 'final', 'finch', 'finds', 'fines', 'finer', 'fined',
+    'fired', 'fires', 'firms', 'firsts', 'first', 'fishy', 'fists', 'fitly',
+    'fixed', 'fixer', 'fjord', 'flack', 'flail', 'flair', 'flake', 'flaky',
+    'flame', 'flank', 'flare', 'flash', 'flask', 'fleck', 'fleet', 'flesh',
+    'flick', 'flier', 'fling', 'flint', 'flirt', 'float', 'flock', 'flood',
+    'floor', 'flora', 'floss', 'flour', 'flout', 'flown', 'fluff', 'fluid',
+    'fluke', 'flume', 'flung', 'flunk', 'flush', 'flute', 'flyer', 'foamy',
+    'focal', 'focus', 'foggy', 'folks', 'folly', 'foods', 'foray', 'force',
+    'forge', 'forgo', 'forks', 'forms', 'forth', 'forty', 'forum', 'fouls',
+    'found', 'fount', 'fours', 'foxes', 'foyer', 'frail', 'frame', 'franc',
+    'frank', 'fraud', 'freak', 'freed', 'freer', 'fresh', 'fried', 'frill',
+    'frisk', 'fritz', 'frock', 'frond', 'front', 'frost', 'froth', 'frown',
+    'froze', 'fruit', 'fudge', 'fully', 'fumed', 'funds', 'fungi', 'funky',
+    'funny', 'furry', 'fussy', 'fuzzy',
+    'gaffe', 'gaily', 'gains', 'gamer', 'games', 'gamma', 'gaped', 'gases',
+    'gauge', 'gaunt', 'gauze', 'gavel', 'gawky', 'gazed', 'gears', 'gecko',
+    'geese', 'gemma', 'genie', 'genre', 'ghost', 'ghoul', 'giant', 'gifts',
+    'girls', 'girth', 'given', 'giver', 'gives', 'glade', 'glaze', 'gleam',
+    'glean', 'glide', 'glint', 'gloat', 'globe', 'gloom', 'glory', 'gloss',
+    'glove', 'glued', 'glyph', 'gnash', 'gnome', 'goals', 'going', 'goofy',
+    'goose', 'gored', 'gorge', 'gouge', 'gourd', 'grace', 'grade', 'graft',
+    'grail', 'grain', 'grand', 'grant', 'grape', 'graph', 'grasp', 'grass',
+    'grate', 'grave', 'gravy', 'graze', 'great', 'greed', 'green', 'greet',
+    'grief', 'grill', 'grime', 'grind', 'gripe', 'groan', 'groin', 'groom',
+    'grope', 'gross', 'group', 'grout', 'grove', 'growl', 'grown', 'gruel',
+    'gruff', 'grunt', 'guard', 'guava', 'guess', 'guest', 'guide', 'guild',
+    'guile', 'guilt', 'guise', 'gulch', 'gully', 'gumbo', 'gummy', 'guppy',
+    'gushy', 'gusto', 'gusty', 'gypsy',
+    'habit', 'hairy', 'halls', 'halted', 'halve', 'hands', 'handy', 'hangs',
+    'happy', 'hardy', 'harem', 'harsh', 'haste', 'hasty', 'hatch', 'hated',
+    'hater', 'haunt', 'haute', 'haven', 'havoc', 'hawks', 'hazel', 'heads',
+    'heady', 'heard', 'heart', 'heath', 'heave', 'heavy', 'hedge', 'heels',
+    'hefty', 'heirs', 'helix', 'hello', 'hells', 'hence', 'heron', 'hertz',
+    'hewed', 'hides', 'hiker', 'hills', 'hilly', 'hilts', 'hinge', 'hippo',
+    'hippy', 'hired', 'hires', 'hitch', 'hives', 'hoard', 'hobby', 'hoist',
+    'holds', 'holly', 'homed', 'homer', 'homes', 'honed', 'honey', 'honor',
+    'hoofs', 'hooks', 'hooky', 'hoops', 'hoots', 'horde', 'horny', 'horse',
+    'hosed', 'hoses', 'hosts', 'hotel', 'hotly', 'hound', 'house', 'hover',
+    'howdy', 'human', 'humid', 'humor', 'humps', 'humus', 'hunch', 'hunky',
+    'hunts', 'hurry', 'husky', 'hutch', 'hydro', 'hyena', 'hymns', 'hyper',
+    'icily', 'icing', 'ideal', 'ideas', 'idiom', 'idiot', 'idled', 'idler',
+    'igloo', 'image', 'imbue', 'impel', 'imply', 'inane', 'inbox', 'incur',
+    'index', 'inept', 'inert', 'infer', 'ingot', 'inked', 'inlay', 'inlet',
+    'inner', 'input', 'inset', 'intro', 'irate', 'irons', 'irony', 'islam',
+    'islet', 'issue', 'itchy', 'ivory',
+    'jaded', 'jaunt', 'jeans', 'jelly', 'jerky', 'jetty', 'jewel', 'jiffy',
+    'joins', 'joint', 'joist', 'joker', 'jolly', 'joust', 'judge', 'juice',
+    'juicy', 'jumbo', 'jumps', 'jumpy', 'junky', 'juror',
+    'kayak', 'kebab', 'keels', 'keeps', 'kelpy', 'kempt', 'ketch', 'khaki',
+    'kicks', 'kills', 'kilts', 'kinda', 'kinds', 'kings', 'kinky', 'kiosk',
+    'kited', 'kites', 'kitty', 'kneed', 'kneel', 'knees', 'knelt', 'knife',
+    'knock', 'knoll', 'knots', 'known', 'knows', 'koala', 'krill',
+    'label', 'labor', 'laced', 'laces', 'laden', 'lader', 'lager', 'laden',
+    'lairs', 'laity', 'lakes', 'lamps', 'lance', 'lands', 'lanes', 'lanky',
+    'lapel', 'lapse', 'large', 'larva', 'laser', 'lasso', 'lasts', 'latch',
+    'later', 'latex', 'lathe', 'laugh', 'layer', 'leach', 'leads', 'leaf',
+    'leafy', 'leaks', 'leaky', 'leant', 'leaps', 'leapt', 'learn', 'lease',
+    'leash', 'least', 'leave', 'ledge', 'leech', 'leers', 'leery', 'lefts',
+    'legal', 'lemon', 'lemur', 'lends', 'level', 'lever', 'liars', 'libel',
+    'liens', 'liked', 'liken', 'lilac', 'limbo', 'limbs', 'limes', 'limit',
+    'limps', 'lined', 'linen', 'liner', 'lines', 'lingo', 'links', 'lions',
+    'lipid', 'liter', 'lithe', 'lived', 'liver', 'lives', 'livid', 'llama',
+    'loads', 'loafs', 'loamy', 'loans', 'lobby', 'local', 'locks', 'lodge',
+    'lofty', 'logic', 'login', 'loins', 'lonely', 'loner', 'longs', 'looks',
+    'looms', 'loony', 'loops', 'loose', 'lords', 'loser', 'loses', 'lousy',
+    'loved', 'lover', 'loves', 'lower', 'lowly', 'loyal', 'lucid', 'lucky',
+    'lumps', 'lumpy', 'lunar', 'lunch', 'lunge', 'lungs', 'lurch', 'lured',
+    'lures', 'lurid', 'lusty', 'lying', 'lymph', 'lyric',
+    'madam', 'madly', 'mafia', 'magic', 'maids', 'mails', 'maims', 'major',
+    'maker', 'makes', 'males', 'malls', 'malts', 'manga', 'mango', 'mania',
+    'manly', 'manor', 'maple', 'march', 'mares', 'marks', 'marry', 'marsh',
+    'masks', 'mason', 'match', 'mated', 'mates', 'maths', 'matte', 'maxim',
+    'maybe', 'mayor', 'meals', 'mealy', 'meant', 'meats', 'meaty', 'medal',
+    'media', 'medic', 'meets', 'melon', 'melts', 'mercy', 'merge', 'merit',
+    'merry', 'meshy', 'messy', 'metal', 'meter', 'metro', 'micro', 'midst',
+    'might', 'milks', 'milky', 'mills', 'mimic', 'mince', 'minds', 'mines',
+    'minor', 'mints', 'minty', 'minus', 'mirth', 'misty', 'mixed', 'mixer',
+    'moats', 'mocha', 'modal', 'model', 'modem', 'moist', 'molar', 'molds',
+    'moldy', 'molts', 'money', 'monks', 'month', 'mooch', 'moods', 'moody',
+    'moons', 'moose', 'moots', 'moral', 'moron', 'morph', 'mossy', 'motel',
+    'motor', 'mound', 'mount', 'mourn', 'mouse', 'mousy', 'mouth', 'moved',
+    'mover', 'moves', 'movie', 'mowed', 'mower', 'much', 'muddy', 'muffs',
+    'mules', 'mulls', 'multi', 'mummy', 'mumps', 'munch', 'mural', 'murky',
+    'music', 'musks', 'musky', 'musty', 'mutts',
+    'nadir', 'naive', 'named', 'names', 'nanny', 'nasal', 'nasty', 'naval',
+    'navel', 'navvy', 'needs', 'needy', 'neigh', 'nerds', 'nerdy', 'nerve',
+    'nests', 'never', 'newer', 'newly', 'newsy', 'nexus', 'niche', 'niece',
+    'nifty', 'night', 'ninth', 'nippy', 'noble', 'nodal', 'nodes', 'noise',
+    'noisy', 'nomad', 'noose', 'north', 'nosed', 'nosey', 'notch', 'noted',
+    'notes', 'novel', 'nudge', 'nukes', 'numbs', 'nurse', 'nutty', 'nylon',
+    'nymph',
+    'oases', 'oasis', 'oaths', 'obese', 'occur', 'ocean', 'octal', 'octet',
+    'odder', 'oddly', 'offal', 'offer', 'often', 'ogled', 'oiled', 'oiler',
+    'older', 'olive', 'olden', 'omega', 'onion', 'onset', 'onto', 'opera',
+    'opine', 'opted', 'optic', 'orbit', 'order', 'organ', 'other', 'otter',
+    'ought', 'ounce', 'outdo', 'outed', 'outer', 'outgo', 'ovals', 'ovary',
+    'overt', 'owing', 'owned', 'owner',
+    'paced', 'pacer', 'paces', 'packs', 'pacts', 'paddy', 'pages', 'paint',
+    'pairs', 'palms', 'panda', 'panel', 'panic', 'pansy', 'pants', 'papal',
+    'paper', 'parka', 'parks', 'parry', 'parse', 'parts', 'party', 'pasta',
+    'paste', 'pasts', 'patch', 'paten', 'patio', 'patty', 'pause', 'paved',
+    'paves', 'payee', 'payer', 'peace', 'peach', 'peaks', 'pearl', 'pears',
+    'pecan', 'pedal', 'peers', 'penal', 'pence', 'penny', 'peony', 'perch',
+    'peril', 'perks', 'perky', 'pesky', 'pesto', 'petal', 'petty', 'phase',
+    'phone', 'phony', 'photo', 'piano', 'picks', 'piece', 'piers', 'piety',
+    'piggy', 'pilaf', 'piled', 'piles', 'pills', 'pilot', 'pinch', 'pinks',
+    'pints', 'pious', 'piped', 'piper', 'pipes', 'pique', 'pitch', 'pithy',
+    'pivot', 'pixel', 'pixie', 'pizza', 'place', 'plaid', 'plain', 'plait',
+    'plane', 'plank', 'plans', 'plant', 'plasma', 'plate', 'plays', 'plaza',
+    'plead', 'pleas', 'pleat', 'pluck', 'plumb', 'plume', 'plump', 'plums',
+    'plumy', 'plush', 'pluto', 'poach', 'pocks', 'poems', 'poets', 'point',
+    'poise', 'poked', 'poker', 'pokes', 'polar', 'poles', 'polio', 'polka',
+    'polls', 'polyp', 'ponds', 'pooch', 'poofs', 'pools', 'poppy', 'porch',
+    'pored', 'pores', 'porky', 'ports', 'posed', 'poser', 'poses', 'posit',
+    'posse', 'posts', 'potty', 'pouch', 'pound', 'pours', 'pouts', 'pouty',
+    'power', 'prank', 'prawn', 'prays', 'preen', 'press', 'price', 'pricy',
+    'pride', 'pried', 'prime', 'primp', 'print', 'prior', 'prism', 'privy',
+    'prize', 'probe', 'prods', 'prom', 'prone', 'prong', 'proof', 'props',
+    'prose', 'proud', 'prove', 'prowl', 'proxy', 'prude', 'prune', 'psalm',
+    'pubic', 'pubs', 'pudgy', 'puffs', 'puffy', 'pulpy', 'pulse', 'pumas',
+    'pumps', 'punch', 'punks', 'pupal', 'pupil', 'puppy', 'puree', 'purer',
+    'purge', 'purse', 'pushy', 'putty',
+    'quack', 'quads', 'quail', 'quake', 'qualm', 'quark', 'quart', 'quash',
+    'quasi', 'queen', 'queer', 'quell', 'query', 'quest', 'queue', 'quick',
+    'quiet', 'quill', 'quilt', 'quint', 'quips', 'quirk', 'quite', 'quits',
+    'quota', 'quote', 'quoth',
+    'rabbi', 'rabid', 'racer', 'races', 'racks', 'radar', 'radii', 'radio',
+    'rafts', 'raged', 'rages', 'raids', 'rails', 'rainy', 'raise', 'rajah',
+    'rakes', 'rally', 'ramps', 'ranch', 'range', 'ranks', 'rants', 'rapid',
+    'rarer', 'rated', 'rates', 'ratio', 'raved', 'raven', 'raves', 'razor',
+    'reach', 'react', 'reads', 'ready', 'realm', 'reams', 'reaps', 'rebel',
+    'rebus', 'rebut', 'recap', 'recon', 'reeds', 'reedy', 'reefs', 'refer',
+    'regal', 'rehab', 'reign', 'reins', 'relax', 'relay', 'relic', 'remit',
+    'renal', 'rendy', 'renew', 'rents', 'repay', 'repel', 'reply', 'reset',
+    'resin', 'rests', 'retch', 'retro', 'retry', 'reuse', 'revel', 'revue',
+    'rhino', 'rhyme', 'rider', 'rides', 'ridge', 'rifle', 'right', 'rigid',
+    'rinds', 'rings', 'rinse', 'riots', 'risen', 'riser', 'rises', 'risky',
+    'rival', 'river', 'rivet', 'roach', 'roads', 'roams', 'roars', 'roast',
+    'robed', 'robes', 'robin', 'robot', 'rocks', 'rocky', 'rodeo', 'roger',
+    'rogue', 'roles', 'rolls', 'roman', 'roomy', 'roost', 'roots', 'roped',
+    'ropes', 'rosary', 'roses', 'roses', 'rosin', 'rotor', 'rouge', 'rough',
+    'round', 'rouse', 'route', 'rover', 'roves', 'rowdy', 'royal', 'ruder',
+    'ruffs', 'ruins', 'ruled', 'ruler', 'rules', 'rumba', 'runic', 'runts',
+    'rural', 'rusty',
+    'sable', 'sacks', 'sadly', 'safer', 'safes', 'saint', 'salad', 'sally',
+    'salon', 'salsa', 'salts', 'salty', 'salve', 'samba', 'sandy', 'sands',
+    'sappy', 'satin', 'satyr', 'sauce', 'saucy', 'saved', 'saves', 'savor',
+    'savvy', 'scabs', 'scald', 'scale', 'scalp', 'scaly', 'scamp', 'scams',
+    'scans', 'scant', 'scare', 'scarf', 'scary', 'scene', 'scent', 'scoff',
+    'scold', 'scone', 'scoop', 'scoot', 'scope', 'score', 'scorn', 'scour',
+    'scout', 'scowl', 'scram', 'scrap', 'scree', 'screw', 'scrub', 'scrum',
+    'scuba', 'sears', 'seats', 'seedy', 'seeds', 'seems', 'seethe', 'sells',
+    'semis', 'sends', 'sense', 'sepia', 'serge', 'serif', 'serum', 'serve',
+    'setup', 'seven', 'sever', 'sewed', 'sewer', 'shack', 'shade', 'shady',
+    'shaft', 'shake', 'shaky', 'shale', 'shall', 'shame', 'shams', 'shank',
+    'shape', 'shard', 'share', 'shark', 'sharp', 'shave', 'shawl', 'shear',
+    'sheds', 'sheen', 'sheep', 'sheer', 'sheet', 'shelf', 'shell', 'shied',
+    'shies', 'shift', 'shine', 'shins', 'shiny', 'ships', 'shire', 'shirk',
+    'shirt', 'shoal', 'shock', 'shoes', 'shone', 'shoo', 'shook', 'shoot',
+    'shops', 'shore', 'shorn', 'short', 'shots', 'shout', 'shove', 'shown',
+    'shows', 'shred', 'shrew', 'shrub', 'shrug', 'shuck', 'shunt', 'shush',
+    'shyly', 'sided', 'sides', 'sidle', 'siege', 'sieve', 'sighs', 'sight',
+    'sigma', 'silks', 'silky', 'silly', 'silts', 'silty', 'since', 'sines',
+    'sinew', 'singe', 'sings', 'sinks', 'sinus', 'sired', 'siren', 'sires',
+    'sissy', 'sites', 'sixth', 'sixty', 'sized', 'sizes', 'skate', 'skein',
+    'skews', 'skids', 'skiff', 'skill', 'skimp', 'skins', 'skips', 'skirt',
+    'skits', 'skulk', 'skull', 'skunk', 'slabs', 'slack', 'slags', 'slain',
+    'slake', 'slams', 'slang', 'slant', 'slap', 'slash', 'slate', 'slats',
+    'slave', 'sleds', 'sleek', 'sleep', 'sleet', 'slept', 'slice', 'slick',
+    'slide', 'slimy', 'sling', 'slink', 'slips', 'slits', 'slobs', 'slope',
+    'slops', 'slosh', 'sloth', 'slots', 'slugs', 'slums', 'slump', 'slung',
+    'slurp', 'slush', 'small', 'smart', 'smash', 'smear', 'smell', 'smelt',
+    'smile', 'smirk', 'smith', 'smock', 'smoke', 'smoky', 'smote', 'smug',
+    'snack', 'snags', 'snail', 'snake', 'snaky', 'snaps', 'snare', 'snarl',
+    'sneak', 'sneer', 'sniff', 'snipe', 'snips', 'snits', 'snobs', 'snoop',
+    'snore', 'snort', 'snots', 'snout', 'snowy', 'snubs', 'snuck', 'snuff',
+    'soaks', 'soaps', 'soapy', 'soars', 'sober', 'socks', 'sodas', 'sofas',
+    'softy', 'soggy', 'solar', 'solid', 'solo', 'solos', 'solve', 'songs',
+    'sonic', 'sonny', 'soothe', 'sooty', 'soppy', 'sorry', 'sorts', 'souls',
+    'sound', 'soups', 'sour', 'south', 'sowed', 'sower', 'space', 'spade',
+    'spank', 'spans', 'spare', 'spark', 'spasm', 'spats', 'spawn', 'speak',
+    'spear', 'speck', 'specs', 'speed', 'spell', 'spelt', 'spend', 'spent',
+    'sperm', 'spice', 'spicy', 'spied', 'spiel', 'spies', 'spike', 'spiky',
+    'spill', 'spilt', 'spine', 'spins', 'spiny', 'spire', 'spite', 'splat',
+    'split', 'spoil', 'spoke', 'spook', 'spool', 'spoon', 'spore', 'sport',
+    'spots', 'spout', 'spray', 'spree', 'sprig', 'spurn', 'spurs', 'spurt',
+    'squad', 'squat', 'squib', 'stack', 'staff', 'stage', 'stags', 'staid',
+    'stain', 'stair', 'stake', 'stale', 'stalk', 'stall', 'stamp', 'stand',
+    'stank', 'staph', 'stare', 'stark', 'stars', 'start', 'stash', 'state',
+    'stats', 'stave', 'stays', 'stead', 'steak', 'steal', 'steam', 'steed',
+    'steel', 'steep', 'steer', 'stems', 'stern', 'stews', 'stick', 'stiff',
+    'still', 'stilt', 'sting', 'stink', 'stint', 'stirs', 'stock', 'stoic',
+    'stoke', 'stole', 'stomp', 'stone', 'stood', 'stool', 'stoop', 'stops',
+    'store', 'stork', 'storm', 'story', 'stout', 'stove', 'stows', 'strap',
+    'straw', 'stray', 'strep', 'strew', 'strip', 'stroll', 'strut', 'stub',
+    'stubs', 'stuck', 'studs', 'study', 'stuff', 'stump', 'stung', 'stunk',
+    'stunt', 'style', 'styli', 'suave', 'sucks', 'suede', 'sugar', 'suing',
+    'suite', 'suits', 'sulky', 'sully', 'sumac', 'summon', 'sunny', 'super',
+    'surer', 'surge', 'surly', 'sushi', 'swabs', 'swami', 'swamp', 'swank',
+    'swans', 'swaps', 'sward', 'swarm', 'swath', 'swats', 'sways', 'swear',
+    'sweat', 'sweep', 'sweet', 'swell', 'swept', 'swift', 'swill', 'swims',
+    'swine', 'swing', 'swipe', 'swirl', 'swish', 'swoon', 'swoop', 'sword',
+    'swore', 'sworn', 'swung', 'synod', 'syrup',
+    'table', 'taboo', 'tacit', 'tacks', 'tacky', 'taffy', 'tails', 'taint',
+    'taken', 'taker', 'takes', 'tales', 'talks', 'talky', 'tally', 'talon',
+    'tamer', 'tames', 'tango', 'tangy', 'tanks', 'tapas', 'taper', 'tapes',
+    'tapir', 'tardy', 'tarot', 'tarry', 'tarts', 'taste', 'tasty', 'tatty',
+    'taunt', 'tawny', 'taxed', 'taxes', 'teach', 'teams', 'tears', 'teary',
+    'tease', 'teddy', 'teens', 'teeth', 'tells', 'tempo', 'tempt', 'tends',
+    'tense', 'tenth', 'tents', 'tepid', 'terms', 'terra', 'terse', 'tests',
+    'testy', 'thank', 'thaws', 'theft', 'their', 'theme', 'there', 'these',
+    'thick', 'thief', 'thigh', 'thine', 'thing', 'think', 'third', 'thirst',
+    'thong', 'thorn', 'those', 'three', 'threw', 'throb', 'throw', 'thrum',
+    'thumb', 'thump', 'thus', 'thyme', 'tiara', 'tibia', 'tidal', 'tided',
+    'tides', 'tiger', 'tight', 'tiled', 'tiles', 'tilts', 'timed', 'timer',
+    'times', 'timid', 'tined', 'tinge', 'tints', 'tipsy', 'tired', 'tires',
+    'tiers', 'titan', 'tithe', 'title', 'toads', 'toady', 'toast', 'today',
+    'toddy', 'toed', 'token', 'tolls', 'tomb', 'tombs', 'tonal', 'toned',
+    'toner', 'tones', 'tongs', 'tonic', 'tools', 'tooth', 'topaz', 'topic',
+    'torah', 'torch', 'torso', 'torte', 'torus', 'total', 'totem', 'touch',
+    'tough', 'tours', 'towed', 'towel', 'tower', 'towns', 'toxic', 'toxin',
+    'toyed', 'trace', 'track', 'tract', 'trade', 'trail', 'train', 'trait',
+    'tramp', 'trams', 'traps', 'trash', 'trawl', 'tread', 'treat', 'trees',
+    'treks', 'trend', 'trial', 'tribe', 'trice', 'trick', 'tried', 'tries',
+    'trill', 'trims', 'tripe', 'trips', 'trite', 'troll', 'troop', 'trope',
+    'trots', 'trout', 'trove', 'truce', 'truck', 'trump', 'trunk', 'truss',
+    'trust', 'truth', 'tryst', 'tuba', 'tubby', 'tubes', 'tucks', 'tufts',
+    'tulip', 'tummy', 'tunas', 'tuned', 'tuner', 'tunes', 'tunic', 'turbo',
+    'turf', 'turfs', 'turfy', 'turns', 'turtle', 'tusk', 'tusks', 'tutor',
+    'tweak', 'tweed', 'tweet', 'twice', 'twigs', 'twine', 'twins', 'twirl',
+    'twist', 'twixt', 'tying', 'typed', 'types', 'typo',
+    'udder', 'ulcer', 'ultra', 'umbra', 'unarm', 'unbar', 'uncle', 'uncut',
+    'under', 'undid', 'undue', 'unfed', 'unfit', 'unify', 'union', 'unite',
+    'units', 'unity', 'unlit', 'unmet', 'unset', 'untie', 'until', 'unwed',
+    'unzip', 'upper', 'upset', 'urban', 'urged', 'urges', 'urine', 'usage',
+    'users', 'usher', 'using', 'usual', 'usurp', 'utile', 'utter',
+    'vague', 'valet', 'valid', 'value', 'valve', 'vamps', 'vapid', 'vapor',
+    'vases', 'vault', 'vaunt', 'veers', 'vegan', 'veils', 'veins', 'velar',
+    'velum', 'vends', 'venom', 'vents', 'venue', 'verbs', 'verge', 'verse',
+    'verso', 'verve', 'vests', 'vetch', 'vetos', 'vexed', 'vexes', 'vials',
+    'viand', 'vicar', 'video', 'views', 'vigil', 'vigor', 'villa', 'vinyl',
+    'viola', 'viper', 'viral', 'virus', 'visas', 'visit', 'visor', 'vista',
+    'vital', 'vivid', 'vixen', 'vocal', 'vodka', 'vogue', 'voice', 'voids',
+    'voila', 'voile', 'volts', 'voted', 'voter', 'votes', 'vouch', 'vowed',
+    'vowel', 'vroom', 'vying',
+    'wacky', 'waded', 'wades', 'wafer', 'wafts', 'waged', 'wager', 'wages',
+    'wagon', 'waist', 'waits', 'waive', 'wakes', 'walks', 'walls', 'waltz',
+    'wands', 'wanes', 'wanly', 'wanna', 'wants', 'wards', 'wares', 'warms',
+    'warns', 'warps', 'warts', 'warty', 'washy', 'waste', 'watch', 'water',
+    'watts', 'waved', 'waver', 'waves', 'waxed', 'waxes', 'wears', 'weary',
+    'weave', 'wedge', 'weeds', 'weedy', 'weeks', 'weeps', 'weepy', 'weigh',
+    'weird', 'wells', 'welsh', 'welts', 'wench', 'whack', 'whale', 'wharf',
+    'wheat', 'wheel', 'whelp', 'where', 'which', 'whiff', 'while', 'whims',
+    'whine', 'whiny', 'whips', 'whirl', 'whirr', 'whisk', 'white', 'whole',
+    'whoop', 'whose', 'wicks', 'widen', 'wider', 'wides', 'widow', 'width',
+    'wields', 'wifi', 'wight', 'wilds', 'wiles', 'wills', 'wilts', 'winds',
+    'windy', 'wines', 'wings', 'winks', 'wiped', 'wiper', 'wipes', 'wired',
+    'wires', 'wiser', 'wispy', 'witch', 'witty', 'wives', 'wonts', 'woods',
+    'woody', 'wooed', 'woofs', 'wools', 'woolly', 'woozy', 'wordy', 'works',
+    'world', 'worms', 'wormy', 'worry', 'worse', 'worst', 'worth', 'would',
+    'wound', 'woven', 'wraps', 'wrath', 'wreak', 'wreck', 'wrens', 'wrest',
+    'wring', 'wrist', 'write', 'writs', 'wrong', 'wrote', 'wrung', 'wryly',
+    'xenon', 'xerox',
+    'yacht', 'yanks', 'yards', 'yarns', 'yawns', 'yearn', 'years', 'yeast',
+    'yells', 'yelps', 'yield', 'yodel', 'yoga', 'yogis', 'yolks', 'young',
+    'youth', 'yummy', 'yuppy',
+    'zebra', 'zeros', 'zesty', 'zilch', 'zippy', 'zonal', 'zoned', 'zones',
+    'zoom', 'zooms',
+]
+# Filter to ensure every entry is exactly 5 letters and lowercase ASCII —
+# any typo above (e.g. a 4- or 6-letter slip) gets quietly dropped instead
+# of crashing zen_play with an off-length solution.
+# A curated set of popular 5-letter plural / inflected forms. Mixed in with
+# the base singular pool so the solution feels natural without being
+# dominated by -s endings.
+ZEN_PLURALS = [
+    'books', 'cards', 'songs', 'words', 'years', 'hours', 'weeks', 'lines',
+    'names', 'films', 'plans', 'signs', 'paths', 'votes', 'tools', 'holes',
+    'bowls', 'doors', 'walls', 'parts', 'hands', 'rooms', 'kinds', 'dates',
+    'types', 'teams', 'tasks', 'rules', 'roles', 'rates', 'roads', 'rings',
+    'roofs', 'roots', 'ropes', 'roses', 'rocks', 'rains', 'races', 'pages',
+    'paths', 'pairs', 'plays', 'plums', 'poems', 'pools', 'ports', 'posts',
+    'shops', 'shots', 'sites', 'sizes', 'skies', 'slots', 'snaps', 'songs',
+    'souls', 'soups', 'stars', 'steps', 'stops', 'suits', 'tales', 'tanks',
+    'tapes', 'taxes', 'tents', 'tests', 'texts', 'tides', 'tiles', 'times',
+    'tones', 'tours', 'towns', 'trays', 'trees', 'trips', 'tubes', 'tunes',
+    'twins', 'units', 'users', 'vases', 'veins', 'vines', 'walks', 'waves',
+    'wires', 'wines', 'wings', 'wipes', 'woods', 'words', 'works', 'yards',
+    'zones', 'beams', 'beans', 'bears', 'beats', 'belts', 'bikes', 'birds',
+    'boats', 'bones', 'boots', 'boxes', 'brews', 'bulbs', 'cakes', 'calls',
+    'camps', 'cases', 'caves', 'cells', 'chips', 'cloud', 'clubs', 'codes',
+    'coins', 'corks', 'costs', 'crews', 'crops', 'cubes', 'curls', 'darts',
+    'decks', 'desks', 'disks', 'dolls', 'drums', 'ducks', 'dunes', 'edges',
+    'eggs',  'elbow', 'faces', 'facts', 'farms', 'feats', 'fires', 'fists',
+    'flags', 'flame', 'flips', 'folds', 'foods', 'forks', 'forts', 'foxes',
+    'gates', 'gears', 'germs', 'ghosts','gifts', 'girls', 'globs', 'goals',
+    'goats', 'gowns', 'gulls', 'guns',  'hairs', 'halls', 'harps', 'hats',
+    'heads', 'heaps', 'heels', 'herbs', 'hills', 'hints', 'hives', 'hooks',
+    'hoofs', 'hopes', 'horns', 'hosts', 'hotel', 'huts',  'jails', 'jars',
+    'jeans', 'jokes', 'judge', 'kicks', 'kings', 'kites', 'knees', 'knots',
+    'labs',  'lakes', 'lambs', 'lamps', 'lanes', 'leafs', 'lifts', 'limbs',
+    'links', 'lions', 'lists', 'locks', 'lords', 'maids', 'malls', 'maps',
+    'marks', 'masks', 'mates', 'meals', 'menus', 'miles', 'minds', 'mines',
+    'modes', 'moods', 'moons', 'moths', 'movie', 'nails', 'necks', 'nests',
+    'newts', 'notes', 'oaks',  'oasis', 'packs', 'palms', 'panes', 'pants',
+    'parks', 'paths', 'peaks', 'pearls','pears', 'peers', 'piles', 'pills',
+    'pipes', 'plows', 'pumps', 'puns',  'punks', 'reefs', 'reels', 'rents',
+    'rests', 'ribs',  'rinds', 'sails', 'sales', 'salts', 'sands', 'scars',
+    'seals', 'seats', 'seeds', 'shells','ships', 'shoes', 'silks', 'silos',
+    'skins', 'skirts','slugs', 'snail', 'soaps', 'socks', 'soils', 'sorts',
+    'spots', 'spies', 'sticks','stems', 'stops', 'swans', 'tents', 'ticks',
+    'tints', 'tires', 'toads', 'tombs', 'traps', 'twigs', 'wages', 'wells',
+    'whales','wharves','whips', 'wicks', 'winds', 'wools', 'worms', 'yells',
+    'zooms',
+]
+ZEN_WORDS = sorted({w for w in (ZEN_WORDS + ZEN_PLURALS)
+                    if len(w) == 5 and w.isascii() and w.isalpha()})
+ZEN_FALLBACK = ZEN_WORDS  # legacy alias
+
+
+_WORDS_CACHE = None
+GUESS_LIST_URL = 'https://raw.githubusercontent.com/tabatkins/wordle-list/main/words'
+GUESS_LIST_CACHE = Path.home() / '.cache' / 'wordle-cli' / 'valid_guesses.txt'
+
+
+def _load_bundled_guesses():
+    """Try the on-disk cache, then fetch the canonical Wordle guess list.
+
+    Returns a sorted list of 5-letter ASCII words, or None on failure.
+    """
+    try:
+        if GUESS_LIST_CACHE.is_file():
+            words = [
+                w for w in GUESS_LIST_CACHE.read_text().split()
+                if len(w) == 5 and w.isascii() and w.isalpha()
+            ]
+            if len(words) >= 5000:
+                return sorted(set(words))
+    except OSError:
+        pass
+    try:
+        import urllib.request
+        with urllib.request.urlopen(GUESS_LIST_URL, timeout=8) as resp:
+            text = resp.read().decode('utf-8', 'ignore')
+        words = [
+            w.lower() for w in text.split()
+            if len(w) == 5 and w.isascii() and w.isalpha()
+        ]
+        if len(words) >= 5000:
+            try:
+                GUESS_LIST_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                GUESS_LIST_CACHE.write_text('\n'.join(sorted(set(words))))
+            except OSError:
+                pass
+            return sorted(set(words))
+    except Exception:
+        pass
+    return None
+
+
+def _load_system_dict():
+    """Fallback: read the system dictionary and synthesize common inflections."""
+    for path in ('/usr/share/dict/words', '/usr/share/words'):
+        try:
+            with open(path) as f:
+                raw = [
+                    w for w in (line.strip().lower() for line in f)
+                    if w.isascii() and w.isalpha() and 3 <= len(w) <= 5
+                ]
+            fives = {w for w in raw if len(w) == 5}
+            # Auto-inflect: most 4-letter words form a valid 5-letter
+            # plural / 3rd-person-singular / past tense. The system dict
+            # often omits these (e.g. "desks", "tiles"), so synthesize.
+            for w in raw:
+                if len(w) == 4:
+                    fives.add(w + 's')
+                    if w.endswith('e'):
+                        fives.add(w + 'd')
+                    if w.endswith('y') and w[-2] not in 'aeiou':
+                        fives.add(w[:-1] + 'ied')
+                elif len(w) == 3:
+                    if w.endswith(('s', 'x', 'z')) or w.endswith(('ch', 'sh')):
+                        fives.add(w + 'es')
+            if len(fives) >= 200:
+                return sorted(fives)
+        except OSError:
+            continue
+    return None
+
+
+def load_words():
+    """Return a comprehensive list of valid 5-letter guess words.
+
+    Prefers the canonical Wordle guess list (~14.8k words), cached locally.
+    Falls back to the system dictionary plus synthesized inflections, then
+    finally to the curated ZEN_WORDS pool.
+    """
+    global _WORDS_CACHE
+    if _WORDS_CACHE is not None:
+        return _WORDS_CACHE
+    words = _load_bundled_guesses() or _load_system_dict()
+    if words is None:
+        words = list(ZEN_FALLBACK)
+    # Always union with the curated zen pool so common solutions are accepted.
+    _WORDS_CACHE = sorted(set(words) | set(ZEN_WORDS))
+    return _WORDS_CACHE
+
+
+def load_zen_words():
+    return load_words()
+
+
+def valid_guess(guess, solution, word_set):
+    """True if `guess` is the solution or appears in `word_set`."""
+    return guess == solution or guess in word_set
+
+
+def play_round(data, solution, word_set, account, hard_mode=False, intro=''):
+    """Run one keystroke-driven round in the framed UI.
+
+    Assumes raw mode is already active and the alt screen has been entered.
+    Returns (guesses, results, won) or (None, None, None) if the user aborted.
+    """
+    guesses, results = [], []
+    current = ''
+    message = intro
+    won = False
+
+    while len(guesses) < 6:
+        render(data, guesses, results, current_guess=current, message=message,
+               account=account, hard_mode=hard_mode)
+        key = read_key()
+        if key in ('ctrl-c', 'ctrl-z', 'esc'):
+            return None, None, None
+        if key == 'enter':
+            if len(current) != 5:
+                message = f'{YELLOW} ! {RESET} Need 5 letters.'
+                continue
+            if hard_mode:
+                greens, min_letters = hard_mode_constraints(guesses, results)
+                violation = hard_mode_violation(current, greens, min_letters)
+                if violation:
+                    message = f'{YELLOW} ! {RESET} {violation}'
+                    continue
+            if not valid_guess(current, solution, word_set):
+                message = f'{YELLOW} ! {RESET} Not in word list.'
+                continue
+            r = score(current, solution)
+            guesses.append(current)
+            results.append(r)
+            if current == solution:
+                won = True
+                break
+            current = ''
+            message = ''
+        elif key == 'backspace':
+            if current:
+                current = current[:-1]
+            message = ''
+        elif len(key) == 1 and key.isalpha() and len(current) < 5:
+            current += key.lower()
+            message = ''
+    return guesses, results, won
+
+
+def final_message(won, guesses, solution):
+    if won:
+        praise = ['Genius!', 'Magnificent!', 'Impressive!',
+                  'Splendid!', 'Great!', 'Phew!'][len(guesses) - 1]
+        return f'{BOLD}{GREEN} {praise} {RESET}  Solved in {len(guesses)}/6.'
+    return f'{BOLD}{GRAY} The word was {solution.upper()} {RESET}'
+
+
+def zen_play(hard_mode=False):
+    # Solutions come from a curated common-word list so puzzles stay
+    # familiar; guesses are validated against the broader system dictionary
+    # (plus the solution itself) so the player can still type uncommon words.
+    solution_pool = ZEN_WORDS
+    word_set = set(load_words()) | set(ZEN_WORDS)
+    rng = random.SystemRandom()
+    session = 0
+    wins = 0
+
+    try:
+        enter_fullscreen()
+        with RawTerminal():
+            while True:
+                session += 1
+                solution = rng.choice(solution_pool)
+                puzzle = {
+                    'days_since_launch': f'zen·{session}',
+                    'print_date': '',
+                    'id': 0,
+                    'solution': solution,
+                }
+                mode_tag = f'{YELLOW} HARD {RESET} ' if hard_mode else ''
+                intro = (f'{mode_tag}{DIM}Zen · session {session}. '
+                         f'Esc to quit.{RESET}')
+                guesses, results, won = play_round(
+                    puzzle, solution, word_set, account=False,
+                    hard_mode=hard_mode, intro=intro)
+                if guesses is None:
+                    return 0
+
+                if won:
+                    wins += 1
+                final_msg = (
+                    f'{final_message(won, guesses, solution)}'
+                    f'   {DIM}· session {wins}/{session}{RESET}'
+                )
+                extra = [
+                    '',
+                    f'{BOLD}Play another?{RESET}  {DIM}[Y / N]{RESET}',
+                ]
+                render(puzzle, guesses, results, message=final_msg,
+                       account=False, hard_mode=hard_mode, extra_lines=extra)
+
+                while True:
+                    key = read_key()
+                    if key in ('ctrl-c', 'ctrl-z', 'esc') or key.lower() == 'n':
+                        return 0
+                    if key == 'enter' or key.lower() == 'y':
+                        break
+    finally:
+        exit_fullscreen()
+
+
+# ---------- main play loop ----------
+
+def main_play(hard_mode=False):
+    today = date.today()
+    try:
+        data = fetch_word(today)
+    except Exception as e:
+        print(f'Could not fetch today\'s Wordle: {e}', file=sys.stderr)
+        return 1
+    solution = data['solution'].lower()
+    puzzle_id = data['id']
+
+    auth = load_auth()
+    cookie = (auth or {}).get('NYT-S')
+    nyt_state = None
+    nyt_view = None
+    nyt_user_id = None
+    sync_warning = ''
+
+    # Auto-retry a previously-pending sync (e.g. failed POST from yesterday).
+    if cookie:
+        pending = load_pending()
+        if pending and not pending.get('synced'):
+            ok, _, _ = try_sync(cookie, pending['puzzle'],
+                                pending['guesses'], pending['results'], pending['won'],
+                                hard_mode=pending.get('hard_mode', False))
+            if ok:
+                mark_synced()
+
+    if cookie:
+        try:
+            resp = nyt_fetch_state(cookie, puzzle_id)
+            states = resp.get('states') or []
+            nyt_state = next(
+                (s for s in states if s.get('puzzle_id') == puzzle_id),
+                states[0] if states else None,
+            )
+            nyt_user_id = (
+                (nyt_state or {}).get('user_id')
+                or (resp.get('player') or {}).get('user_id')
+            )
+            nyt_view = nyt_view_from_response(resp)
+        except urllib.error.HTTPError as e:
+            sync_warning = f'NYT sync unavailable (HTTP {e.code}). Playing offline.'
+            cookie = None
+        except Exception as e:
+            sync_warning = f'NYT sync unavailable ({e}). Playing offline.'
+            cookie = None
+
+    local_stats = load_stats()
+
+    nyt_done_today = bool(
+        nyt_state
+        and (nyt_state.get('game_data', {}).get('status') in ('WIN', 'FAIL'))
+        and nyt_state.get('print_date') == today.isoformat()
+    )
+    local_done_today = local_stats.get('last_date') == today.isoformat()
+
+    if nyt_done_today or local_done_today:
+        sys.stdout.write(CLEAR)
+        print(f'  {BOLD}You\'ve already played today\'s Wordle.{RESET}')
+        if nyt_view:
+            show_stats(nyt_view, source='NYT account')
+        else:
+            show_stats(local_stats, source='local')
+        return 0
+
+    word_set = set(load_words())
+
+    mode_tag = f'{YELLOW} HARD {RESET} ' if hard_mode else ''
+    intro = f'{mode_tag}{DIM}Guess the 5-letter word. Esc to quit.{RESET}'
+    if sync_warning:
+        intro = f'{YELLOW} ! {RESET} {sync_warning}'
+
+    do_copy = False
+    try:
+        enter_fullscreen()
+        with RawTerminal():
+            guesses, results, won = play_round(
+                data, solution, word_set, account=bool(cookie),
+                hard_mode=hard_mode, intro=intro)
+            if guesses is None:
+                return 0
+            final_msg = final_message(won, guesses, solution)
+            render(data, guesses, results, message=final_msg,
+                   account=bool(cookie), hard_mode=hard_mode,
+                   extra_lines=['', COPY_HINT])
+            do_copy = (read_key().lower() == 'c')
+    finally:
+        exit_fullscreen()
+
+    print()
+    print(f'  {final_msg}')
+    print()
+    share = share_text(data, guesses, results, won, hard_mode)
+    for line in share.splitlines():
+        print('  ' + line)
+    print()
+    if do_copy:
+        if copy_to_clipboard(share):
+            print(f'  {GREEN} ✓ {RESET} Copied to clipboard.')
+        else:
+            print(f'  {YELLOW} ! {RESET} Clipboard tool not found — share text above.')
+
+    local_stats = update_local_stats(local_stats, won, len(guesses), today)
+    save_pending(data, guesses, results, won, hard_mode=hard_mode)
+
+    synced = False
+    if cookie:
+        ok, err, view = try_sync(cookie, data, guesses, results, won,
+                                 nyt_state, nyt_user_id, hard_mode=hard_mode)
+        if ok:
+            synced = True
+            nyt_view = view or nyt_view
+            mark_synced()
+        else:
+            print(f'  {YELLOW} ! {RESET} {err} Stats saved locally; '
+                  f'run {BOLD}wordle sync{RESET} later to retry.')
+
+    if synced and nyt_view:
+        show_stats(nyt_view, source=f'NYT account · synced')
+    else:
+        show_stats(local_stats, source='local')
+    return 0
+
+
+def archive_play(num, hard_mode=False):
+    """Play a historical Wordle by puzzle number. Does not touch local stats
+    or sync to NYT — archive runs are off-the-books."""
+    try:
+        data = fetch_word_by_number(num)
+    except ValueError as e:
+        print(f'  {YELLOW} ! {RESET} {e}', file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f'Could not fetch archive Wordle #{num}: {e}', file=sys.stderr)
+        return 1
+    solution = data['solution'].lower()
+    word_set = set(load_words())
+
+    mode_tag = f'{YELLOW} HARD {RESET} ' if hard_mode else ''
+    intro = (f'{mode_tag}{DIM}Archive · Wordle #{num} ({data.get("print_date","")}). '
+             f'Esc to quit.{RESET}')
+
+    do_copy = False
+    try:
+        enter_fullscreen()
+        with RawTerminal():
+            guesses, results, won = play_round(
+                data, solution, word_set, account=False,
+                hard_mode=hard_mode, intro=intro)
+            if guesses is None:
+                return 0
+            final_msg = final_message(won, guesses, solution)
+            render(data, guesses, results, message=final_msg,
+                   account=False, hard_mode=hard_mode,
+                   extra_lines=['', COPY_HINT])
+            do_copy = (read_key().lower() == 'c')
+    finally:
+        exit_fullscreen()
+
+    print()
+    print(f'  {final_msg}')
+    print()
+    share = share_text(data, guesses, results, won, hard_mode)
+    for line in share.splitlines():
+        print('  ' + line)
+    print()
+    if do_copy:
+        if copy_to_clipboard(share):
+            print(f'  {GREEN} ✓ {RESET} Copied to clipboard.')
+        else:
+            print(f'  {YELLOW} ! {RESET} Clipboard tool not found — share text above.')
+    return 0
+
+
+def _extract_archive_num(args):
+    """Pull an `-a N`, `-aN`, `--archive N`, or `--archive=N` flag out of args.
+    Returns (num_or_None, remaining_args, error_msg_or_None)."""
+    out = []
+    i = 0
+    num = None
+    while i < len(args):
+        a = args[i]
+        if a in ('-a', '--archive'):
+            if i + 1 >= len(args):
+                return None, args, f'{a} requires a Wordle number.'
+            try:
+                num = int(args[i + 1])
+            except ValueError:
+                return None, args, f'{a} expects a number, got "{args[i + 1]}".'
+            i += 2
+            continue
+        if a.startswith('--archive='):
+            try:
+                num = int(a.split('=', 1)[1])
+            except ValueError:
+                return None, args, f'--archive expects a number, got "{a}".'
+            i += 1
+            continue
+        if a.startswith('-a') and len(a) > 2 and a[2:].lstrip('-').isdigit():
+            try:
+                num = int(a[2:])
+            except ValueError:
+                return None, args, f'-a expects a number, got "{a}".'
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return num, out, None
+
+
+def main():
+    args = sys.argv[1:]
+    hard_mode = '--hard' in args
+    zen = '--zen' in args
+    args = [a for a in args if a not in ('--hard', '--zen')]
+
+    archive_num, args, err = _extract_archive_num(args)
+    if err:
+        print(f'  {YELLOW} ! {RESET} {err}', file=sys.stderr)
+        return 2
+
+    if archive_num is not None and zen:
+        print(f'  {YELLOW} ! {RESET} --zen and --archive can\'t be combined.',
+              file=sys.stderr)
+        return 2
+
+    if archive_num is not None:
+        return archive_play(archive_num, hard_mode=hard_mode)
+    if zen:
+        return zen_play(hard_mode=hard_mode)
+    if not args:
+        return main_play(hard_mode=hard_mode)
+    cmd = args[0].lower()
+    if cmd in ('login', 'signin'):
+        return cmd_login()
+    if cmd in ('logout', 'signout'):
+        return cmd_logout()
+    if cmd in ('status', 'whoami'):
+        return cmd_status()
+    if cmd in ('sync', 'push'):
+        return cmd_sync()
+    if cmd in ('share', 'copy', 'result'):
+        return cmd_share()
+    if cmd in ('-h', '--help', 'help'):
+        print(f'{BOLD}wordle{RESET}                 Play today\'s NYT Wordle')
+        print(f'{BOLD}wordle --hard{RESET}          Hard mode (greens/yellows must be reused)')
+        print(f'{BOLD}wordle --zen{RESET}           Unlimited offline play with random words')
+        print(f'{BOLD}wordle -a N{RESET}            Play archive Wordle #N (e.g. -a 546)')
+        print(f'{DIM}                       --hard combines with --zen or -a.{RESET}')
+        print(f'{BOLD}wordle share{RESET}           Copy last game\'s share text to clipboard')
+        print(f'{BOLD}wordle login{RESET}           Connect to NYT account (paste NYT-S cookie)')
+        print(f'{BOLD}wordle logout{RESET}          Disconnect NYT account')
+        print(f'{BOLD}wordle status{RESET}          Show login status')
+        print(f'{BOLD}wordle sync{RESET}            Retry pushing the last game to NYT')
+        return 0
+    print(f'Unknown command: {cmd}. Try `wordle help`.', file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
