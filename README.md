@@ -1,6 +1,6 @@
 # cli-wordle
 
-A full-screen terminal Wordle clone in a single Python file. Plays the daily NYT puzzle, archive puzzles by number, or an offline zen mode with a curated common-word pool.
+A beautiful full-screen terminal Wordle clone in a single Python file. Plays the daily NYT puzzle, archive puzzles by number, or an offline zen mode with a curated common-word pool.
 
 ## Features
 
