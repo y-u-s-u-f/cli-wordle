@@ -17,7 +17,7 @@ A full-screen terminal Wordle clone in a single Python file. Plays the daily NYT
 ## Install
 
 ```bash
-git clone https://github.com/<you>/cli-wordle.git
+git clone https://github.com/y-u-s-u-f/cli-wordle.git
 cd cli-wordle
 chmod +x wordle
 ./wordle
