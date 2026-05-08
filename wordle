@@ -867,9 +867,15 @@ def try_sync(cookie, puzzle_data, guesses, results, won,
         # Try the value derived from prev_state first, then a fan-out of
         # plausible alternates the NYT backend has used. Stop on success.
         candidates = []
-        for v in [derived, 'v2', 'v3', 'v4', 5, 6, 7, '5', '6', '7', None]:
+        for v in [derived,
+                  'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v1',
+                  2, 3, 4, 5, 6, 7, 1,
+                  '2', '3', '4', '5', '6', '7', '1',
+                  None]:
             if v not in candidates:
                 candidates.append(v)
+        debug = os.environ.get('WORDLE_DEBUG')
+        debug_log = []
         last_err = None
         for sv in candidates:
             body = build_post_body(prev_state, puzzle_data, game_data,
@@ -877,6 +883,8 @@ def try_sync(cookie, puzzle_data, guesses, results, won,
                                    schema_override=sv)
             try:
                 resp = nyt_post_state(cookie, body, trigger='complete')
+                if debug:
+                    sys.stderr.write(f'[wordle-debug] sync ok with schema_version={sv!r}\n')
                 return True, '', nyt_view_from_response(resp)
             except urllib.error.HTTPError as e:
                 err_body = ''
@@ -885,9 +893,18 @@ def try_sync(cookie, puzzle_data, guesses, results, won,
                 except Exception:
                     pass
                 last_err = (e.code, err_body)
+                debug_log.append(f'  schema_version={sv!r} → HTTP {e.code} {err_body}')
                 # Only iterate on schema-version errors; bail on other 4xx/5xx.
                 if e.code != 400 or 'schema' not in err_body.lower():
                     break
+        if debug:
+            sys.stderr.write('[wordle-debug] all sync attempts failed:\n')
+            sys.stderr.write('\n'.join(debug_log) + '\n')
+            try:
+                sys.stderr.write('[wordle-debug] prev_state snapshot: '
+                                 + json.dumps(prev_state, default=str)[:800] + '\n')
+            except Exception:
+                pass
         code, err_body = last_err if last_err else (0, '')
         return False, f'Sync failed (HTTP {code}). {err_body}'.strip(), None
     except urllib.error.HTTPError as e:
