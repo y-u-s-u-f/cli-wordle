@@ -577,6 +577,28 @@ def nyt_fetch_state(cookie, puzzle_id):
     return nyt_request('GET', url, cookie)
 
 
+def nyt_fetch_latest_states(cookie):
+    """Fetch the user's recent wordleV2 states (no puzzle filter).
+
+    Used to discover the current accepted `schema_version` when the
+    targeted GET returns no rows (e.g. first time syncing today's puzzle).
+    """
+    return nyt_request('GET', NYT_GET_URL, cookie)
+
+
+def _discover_schema_version(cookie):
+    """Best-effort: find a working schema_version from any recent state."""
+    try:
+        resp = nyt_fetch_latest_states(cookie)
+    except Exception:
+        return None
+    for s in (resp.get('states') or []):
+        sv = _extract_schema_version(s)
+        if sv:
+            return sv
+    return None
+
+
 def nyt_post_state(cookie, body, trigger='complete'):
     from datetime import datetime, timezone
     iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.') \
@@ -864,13 +886,15 @@ def try_sync(cookie, puzzle_data, guesses, results, won,
         game_data = build_game_data(prev_state, puzzle_data, guesses, results, won,
                                     hard_mode=hard_mode)
         derived = _extract_schema_version(prev_state)
-        # Try the value derived from prev_state first, then a fan-out of
-        # plausible alternates the NYT backend has used. Stop on success.
+        # If the targeted GET returned no prev_state for this puzzle, ask
+        # NYT for any recent state and crib its schema_version.
+        if not derived:
+            derived = _discover_schema_version(cookie)
+        # Try the discovered value first, then a fan-out of plausible
+        # alternates. Server has confirmed the field must be a string.
         candidates = []
         for v in [derived,
                   'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v1',
-                  2, 3, 4, 5, 6, 7, 1,
-                  '2', '3', '4', '5', '6', '7', '1',
                   None]:
             if v not in candidates:
                 candidates.append(v)
