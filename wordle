@@ -890,10 +890,12 @@ def try_sync(cookie, puzzle_data, guesses, results, won,
         # NYT for any recent state and crib its schema_version.
         if not derived:
             derived = _discover_schema_version(cookie)
-        # Try the discovered value first, then a fan-out of plausible
-        # alternates. Server has confirmed the field must be a string.
+        # Hard-coded fallback matches the value pinned in NYT's wordle JS
+        # bundle (schemaVersion = "0.45.0" as of 2026-05). They bump this
+        # occasionally; if it stops working, scrape the latest from
+        # /games/wordle/index.html or pull from any prev_state.
         candidates = []
-        for v in [derived,
+        for v in [derived, '0.45.0',
                   'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v1',
                   None]:
             if v not in candidates:
