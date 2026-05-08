@@ -960,7 +960,7 @@ def cmd_sync():
                              pending['guesses'], pending['results'], pending['won'],
                              hard_mode=pending.get('hard_mode', False))
     if ok:
-        clear_pending()
+        mark_synced()
         print(f'  {GREEN} ✓ {RESET} Synced.')
         if view:
             show_stats(view, source='NYT account')
