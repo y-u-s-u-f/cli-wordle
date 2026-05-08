@@ -610,20 +610,47 @@ def build_game_data(prev_state, puzzle_data, guesses, results, won, hard_mode=Fa
     }
 
 
-def build_post_body(prev_state, puzzle_data, game_data, fallback_user_id=None):
-    """Wrap game_data into the envelope the /svc/games/state POST expects."""
-    schema_version = (prev_state or {}).get('schema_version') \
-        or (prev_state or {}).get('schemaVersion') \
-        or 'v2'
+def _extract_schema_version(prev_state):
+    """Schema version may live at several keys depending on NYT response shape."""
+    if not prev_state:
+        return None
+    for k in ('schema_version', 'schemaVersion', 'schema'):
+        v = prev_state.get(k)
+        if v not in (None, ''):
+            return v
+    gd = prev_state.get('game_data') or {}
+    for k in ('schema_version', 'schemaVersion'):
+        v = gd.get(k)
+        if v not in (None, ''):
+            return v
+    return None
+
+
+_SCHEMA_SENTINEL = object()
+
+
+def build_post_body(prev_state, puzzle_data, game_data, fallback_user_id=None,
+                    schema_override=_SCHEMA_SENTINEL):
+    """Wrap game_data into the envelope the /svc/games/state POST expects.
+
+    `schema_override` controls schema_version: pass `None` to omit the field,
+    any other value to use it verbatim, or leave unset to derive from
+    prev_state (falling back to 'v2').
+    """
+    if schema_override is _SCHEMA_SENTINEL:
+        schema_version = _extract_schema_version(prev_state) or 'v2'
+    else:
+        schema_version = schema_override
     user_id = (prev_state or {}).get('user_id') or fallback_user_id
     body = {
         'game': 'wordleV2',
         'game_data': game_data,
         'puzzle_id': str(puzzle_data['id']),
         'print_date': puzzle_data.get('print_date', date.today().isoformat()),
-        'schema_version': schema_version,
         'timestamp': int(time.time() * 1000),
     }
+    if schema_version is not None:
+        body['schema_version'] = schema_version
     if user_id is not None:
         body['user_id'] = user_id
     return body
@@ -815,7 +842,9 @@ def cmd_logout():
 
 def try_sync(cookie, puzzle_data, guesses, results, won,
              prev_state=None, fallback_user_id=None, hard_mode=False):
-    """Attempt one POST to NYT. Returns (ok, error_msg, nyt_view)."""
+    """Attempt to POST to NYT. On 'no such schema version' 400s, retries
+    with alternate schema_version values. Returns (ok, error_msg, nyt_view).
+    """
     try:
         if prev_state is None:
             try:
@@ -834,10 +863,33 @@ def try_sync(cookie, puzzle_data, guesses, results, won,
                 pass
         game_data = build_game_data(prev_state, puzzle_data, guesses, results, won,
                                     hard_mode=hard_mode)
-        body = build_post_body(prev_state, puzzle_data, game_data,
-                               fallback_user_id=fallback_user_id)
-        resp = nyt_post_state(cookie, body, trigger='complete')
-        return True, '', nyt_view_from_response(resp)
+        derived = _extract_schema_version(prev_state)
+        # Try the value derived from prev_state first, then a fan-out of
+        # plausible alternates the NYT backend has used. Stop on success.
+        candidates = []
+        for v in [derived, 'v2', 'v3', 'v4', 5, 6, 7, '5', '6', '7', None]:
+            if v not in candidates:
+                candidates.append(v)
+        last_err = None
+        for sv in candidates:
+            body = build_post_body(prev_state, puzzle_data, game_data,
+                                   fallback_user_id=fallback_user_id,
+                                   schema_override=sv)
+            try:
+                resp = nyt_post_state(cookie, body, trigger='complete')
+                return True, '', nyt_view_from_response(resp)
+            except urllib.error.HTTPError as e:
+                err_body = ''
+                try:
+                    err_body = e.read().decode('utf-8', errors='replace')[:300]
+                except Exception:
+                    pass
+                last_err = (e.code, err_body)
+                # Only iterate on schema-version errors; bail on other 4xx/5xx.
+                if e.code != 400 or 'schema' not in err_body.lower():
+                    break
+        code, err_body = last_err if last_err else (0, '')
+        return False, f'Sync failed (HTTP {code}). {err_body}'.strip(), None
     except urllib.error.HTTPError as e:
         try:
             err_body = e.read().decode('utf-8', errors='replace')[:200]
